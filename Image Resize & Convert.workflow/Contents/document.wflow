@@ -1,0 +1,652 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMApplicationBuild</key>
+	<string>523.1</string>
+	<key>AMApplicationVersion</key>
+	<string>2.10</string>
+	<key>AMDocumentVersion</key>
+	<string>2</string>
+	<key>actions</key>
+	<array>
+		<dict>
+			<key>action</key>
+			<dict>
+				<key>AMAccepts</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Optional</key>
+					<true/>
+					<key>Types</key>
+					<array>
+						<string>com.apple.applescript.object</string>
+					</array>
+				</dict>
+				<key>AMActionVersion</key>
+				<string>1.0.2</string>
+				<key>AMApplication</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>AMParameterProperties</key>
+				<dict>
+					<key>source</key>
+					<dict/>
+				</dict>
+				<key>AMProvides</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Types</key>
+					<array>
+						<string>com.apple.applescript.object</string>
+					</array>
+				</dict>
+				<key>ActionBundlePath</key>
+				<string>/System/Library/Automator/Run AppleScript.action</string>
+				<key>ActionName</key>
+				<string>Run AppleScript</string>
+				<key>ActionParameters</key>
+				<dict>
+					<key>source</key>
+					<string># This script provides options to resize, change quality, or convert images via a context menu Quick Action.
+# It uses the built-in 'sips' command-line tool.
+#
+# Version 16: Refined Quick Save handler to use 'dirname' shell command for robust container path derivation.
+# Version 15: Implemented collision avoidance for non-confirmed batch saves in Reduce/Resize handlers.
+#             Removed Finder interaction from Quick Save handler for consistency.
+
+# Handler for the Quick Action
+on run {input, parameters}
+
+	# Check if any files were actually selected
+	if input is {} then
+		display dialog "No image files were selected." buttons {"OK"} default button "OK" with title "Image Action Error" with icon stop
+		return
+	end if
+
+	# --- Main Action Choice Dialog ---
+	set mainActionList to {"Reduce File Size (Change Compression)", "Resize Image (Change Dimensions)", "Quick Save as JPG (75%, Same Folder)"} # Clarified Quick Save destination
+	try
+		set chosenAction to choose from list mainActionList with prompt "Select an action for the selected image(s):" with title "Image Actions" OK button name "Next" cancel button name "Cancel"
+		if chosenAction is false then error number -128 # User cancelled
+		set chosenAction to item 1 of chosenAction
+	on error number -128 # Handle user cancellation
+		return # Stop the script
+	end try
+
+	# --- Process Based on Choice ---
+	if chosenAction is "Reduce File Size (Change Compression)" then
+		processReduceFileSize(input)
+	else if chosenAction is "Resize Image (Change Dimensions)" then
+		processResizeImage(input) # Pass input files to the handler
+	else if chosenAction starts with "Quick Save as JPG" then
+		processQuickSaveAsJPG(input)
+	end if
+
+	# --- Completion Notification (only if an action was attempted and not cancelled mid-way) ---
+	try
+		# Check if chosenAction variable exists (i.e., wasn't cancelled at the very start)
+		if chosenAction is not "" then
+			# As of Sun, Apr 27, 2025 11:33 AM PDT, providing final notification.
+			display notification "Image processing batch finished or cancelled." with title "Image Actions" subtitle ("Action attempted: " &amp; chosenAction)
+		end if
+	on error
+		# Ignore potential errors displaying notification
+	end try
+
+end run # END OF 'on run' HANDLER
+
+
+# --- Handler for Reducing File Size (JPG Quality) ---
+# (Includes v15 collision avoidance)
+on processReduceFileSize(fileList)
+	local chosenQuality, sipsQualityOption, outputFolderAlias, outputFolder, confirmNamesIndividually, currentFileAlias, currentFilePath, originalName, originalExtension, originalFullName, nameResult, chosenOutputFileName, baseName, ext, finalOutputFilePath, outputFilePathQuoted, sipsCommand, errMsg, errNum, finalOutputExtension, counter
+
+	# Set the output extension for this action
+	set finalOutputExtension to "jpg" # Reduce size always outputs JPG
+
+	set qualityLevels to {"High", "Medium", "Low"}
+	try
+		# Dialog 1: Choose Quality
+		set chosenQuality to choose from list qualityLevels with prompt "Step 1: Select JPG quality level (output will be JPG)." default items {"Medium"} with title "Reduce File Size" OK button name "Next" cancel button name "Cancel"
+		if chosenQuality is false then error number -128 # User cancelled quality choice
+		set chosenQuality to item 1 of chosenQuality
+
+		# Map friendly names to sips formatOptions
+		set sipsQualityOption to "normal" # Default to Medium
+		if chosenQuality is "High" then
+			set sipsQualityOption to "high"
+		else if chosenQuality is "Low" then
+			set sipsQualityOption to "low"
+		end if
+
+	on error number -128 # Handle user cancellation of quality choice
+		display notification "Action cancelled: No quality level selected." with title "Image Actions"
+		return # Stop this specific action
+	end try
+
+	# Dialog 2: Choose output folder ONCE
+	try
+		set outputFolderAlias to choose folder with prompt "Step 2: Select a folder to save the compressed JPG files:"
+		set outputFolder to POSIX path of outputFolderAlias
+	on error number -128 # Handle user cancellation of folder choice
+		display notification "Action cancelled: No output folder selected." with title "Image Actions"
+		return # Stop this specific action
+	end try
+
+	# Dialog 3: Ask about confirming names
+	set confirmNamesIndividually to false # Default
+	if (count of fileList) is 1 then
+		set confirmNamesIndividually to true # Always confirm for single file
+	else
+		# Ask only if multiple files
+		try
+			set nameConfirmChoice to display dialog "Step 3: Confirm/edit each filename individually?" buttons {"No, Use Original Names", "Yes, Confirm Each"} default button "No, Use Original Names" cancel button "No, Use Original Names" with title "Filename Confirmation"
+			if button returned of nameConfirmChoice is "Yes, Confirm Each" then
+				set confirmNamesIndividually to true
+			end if
+		on error number -128
+			# User cancelled dialog, default (false) remains.
+		end try
+	end if
+
+	# Process each file
+	repeat with currentFileAlias in fileList
+		try
+			set currentFilePath to POSIX path of currentFileAlias
+			set {originalName, originalExtension} to my getFileNameAndExtension(currentFilePath)
+
+			# Construct the default output filename (original name + target extension)
+			set originalFullName to originalName &amp; "." &amp; finalOutputExtension
+			set chosenOutputFileName to originalFullName # Start with the default
+
+			# Dialog 4 (Optional, Per File): Confirm/Edit output filename IF requested
+			if confirmNamesIndividually then
+				try
+					set nameResult to display dialog "Confirm or edit output filename for '" &amp; originalName &amp; "." &amp; originalExtension &amp; "':" default answer originalFullName with title "Confirm Output Filename"
+					set chosenOutputFileName to text returned of nameResult
+					if chosenOutputFileName is "" then error "Filename cannot be empty." # Prevent empty names
+
+					# Ensure the chosen name ends with the correct extension
+					set {baseName, ext} to my getFileNameAndExtensionFromText(chosenOutputFileName)
+					if ext does not equal finalOutputExtension then
+						chosenOutputFileName to baseName &amp; "." &amp; finalOutputExtension
+						display notification "Filename adjusted to end with '." &amp; finalOutputExtension &amp; "'" with title "Filename Corrected"
+					end if
+
+				on error errMsg number errNum
+					if errNum = -128 then # User cancelled this specific file's naming
+						display notification "File skipped due to cancellation: " &amp; originalName with title "File Skipped"
+						iterate # Skip to the next file
+					else
+						# Handle other errors like empty filename
+						display dialog "Invalid filename provided: " &amp; errMsg &amp; "\nSkipping this file." buttons {"OK"} default button "OK" with title "Naming Error"
+						iterate # Skip this file
+					end if
+				end try
+			end if # End check for confirmNamesIndividually
+
+			# *** ADDED: Collision Avoidance if NOT confirming names individually (v15) ***
+			set finalOutputFilePath to outputFolder &amp; chosenOutputFileName
+			if not confirmNamesIndividually then
+				set counter to 1
+				set {baseName, ext} to my getFileNameAndExtensionFromText(chosenOutputFileName) # Use utility
+				# Ensure baseName and ext are valid before loop
+				if ext is "" then set ext to finalOutputExtension # Fallback if somehow empty
+				if baseName is "" then set baseName to "untitled"
+
+				repeat while (my fileExists(finalOutputFilePath))
+					set chosenOutputFileName to baseName &amp; "-" &amp; counter &amp; "." &amp; ext
+					set finalOutputFilePath to outputFolder &amp; chosenOutputFileName
+					set counter to counter + 1
+				end repeat
+			end if
+			# *** END: Collision Avoidance ***
+
+			# Construct the final full output path using the potentially modified name
+			set outputFilePathQuoted to quoted form of finalOutputFilePath
+
+			# Build and run sips command. System will handle overwrite behavior only if confirming individually.
+			set sipsCommand to "sips -s format jpeg -s formatOptions " &amp; sipsQualityOption &amp; " " &amp; quoted form of currentFilePath &amp; " --out " &amp; outputFilePathQuoted
+			do shell script sipsCommand
+
+		on error errMsg number errNum
+			# Catch errors from sips or other issues.
+			if errNum is not -128 then
+				display dialog "Error processing file: " &amp; originalName &amp; "." &amp; originalExtension &amp; "\n\nError: " &amp; errMsg buttons {"OK"} default button "OK" with title "File Processing Error" with icon stop
+			else
+				# Avoid double notifications if they cancelled naming dialog
+				# display notification "Save possibly cancelled for: " &amp; chosenOutputFileName with title "Save Cancelled?"
+			end if
+			# Continue to the next file regardless of error/cancellation here
+		end try
+	end repeat # End of loop through fileList
+
+end processReduceFileSize # END OF 'processReduceFileSize' HANDLER
+
+
+# --- Handler for Resizing Image ---
+# (Includes v15 collision avoidance)
+on processResizeImage(fileList)
+	local chosenResize, percentageValue, outputFolderAlias, outputFolder, confirmNamesIndividually, currentFileAlias, currentFilePath, currentFilePathQuoted, originalName, originalExtension, originalFullName, nameResult, chosenOutputFileName, baseName, ext, finalOutputFilePath, outputFilePathQuoted, dimensionsOutput, currentWidth, currentHeight, maxDimension, sipsCommand, errMsg, errNum, finalOutputExtension, containsPNG, convertPNGsToJPG, counter
+
+	set resizeOptions to {"75%", "50%", "25%"}
+	try
+		# Dialog 1: Choose Resize Percentage
+		set chosenResize to choose from list resizeOptions with prompt "Step 1: Select resize percentage." default items {"50%"} with title "Resize Image" OK button name "Next" cancel button name "Cancel"
+		if chosenResize is false then error number -128 # User cancelled resize choice
+		set chosenResize to item 1 of chosenResize
+
+		# Extract percentage value
+		set percentageValue to 0.5 # Default
+		if chosenResize is "75%" then
+			set percentageValue to 0.75
+		else if chosenResize is "25%" then
+			set percentageValue to 0.25
+		end if
+
+	on error number -128 # Handle user cancellation of resize choice
+		display notification "Action cancelled: No resize percentage selected." with title "Image Actions"
+		return # Stop this specific action
+	end try
+
+	# Check for PNGs and ask format ONCE
+	set containsPNG to false
+	set convertPNGsToJPG to false # Default is to keep PNGs as PNG
+	repeat with tempFileAlias in fileList
+		try
+			set {tempName, tempExt} to my getFileNameAndExtension(POSIX path of tempFileAlias)
+			if tempExt as string is equal to "png" then
+				set containsPNG to true
+				exit repeat
+			end if
+		on error
+			# Ignore errors checking extensions here
+		end try
+	end repeat
+
+	if containsPNG then
+		try
+			set formatChoice to display dialog "PNG file(s) detected in selection. Choose output format for PNGs:" buttons {"Keep PNG", "Convert PNGs to JPG"} default button "Keep PNG" cancel button "Keep PNG" with title "PNG Format Choice (Batch)"
+			if button returned of formatChoice is "Convert PNGs to JPG" then
+				set convertPNGsToJPG to true
+			end if
+		on error number -128
+			# User cancelled, keep as PNG
+			display notification "Keeping format as PNG for any PNG files." with title "Format Choice"
+		end try
+	end if
+
+	# Dialog 2: Choose output folder ONCE
+	try
+		set outputFolderAlias to choose folder with prompt "Step 2: Select a folder to save the resized image files:"
+		set outputFolder to POSIX path of outputFolderAlias
+	on error number -128 # Handle user cancellation of folder choice
+		display notification "Action cancelled: No output folder selected." with title "Image Actions"
+		return # Stop this specific action
+	end try
+
+	# Dialog 3: Ask about confirming names
+	set confirmNamesIndividually to false # Default
+	if (count of fileList) is 1 then
+		set confirmNamesIndividually to true # Always confirm for single file
+	else
+		# Ask only if multiple files
+		try
+			set nameConfirmChoice to display dialog "Step 3: Confirm/edit each filename individually?" buttons {"No, Use Original Names", "Yes, Confirm Each"} default button "No, Use Original Names" cancel button "No, Use Original Names" with title "Filename Confirmation"
+			if button returned of nameConfirmChoice is "Yes, Confirm Each" then
+				set confirmNamesIndividually to true
+			end if
+		on error number -128
+			# User cancelled dialog, default (false) remains.
+		end try
+	end if
+
+	# Process each file
+	repeat with currentFileAlias in fileList
+		try
+			set currentFilePath to POSIX path of currentFileAlias
+			set currentFilePathQuoted to quoted form of currentFilePath
+			set {originalName, originalExtension} to my getFileNameAndExtension(currentFilePath)
+
+			# Determine final output extension based on batch choice
+			set finalOutputExtension to originalExtension
+			if finalOutputExtension is "" then set finalOutputExtension to "png" # Default if no original extension
+
+			set isPNG to (originalExtension as string is equal to "png")
+			set convertThisFile to (isPNG and convertPNGsToJPG)
+
+			if convertThisFile then
+				set finalOutputExtension to "jpg"
+			end if
+
+			# Construct the default output filename (using potentially new extension)
+			set originalFullName to originalName &amp; "." &amp; finalOutputExtension
+			set chosenOutputFileName to originalFullName # Start with the default
+
+			# Dialog 4 (Optional, Per File): Confirm/Edit output filename IF requested
+			if confirmNamesIndividually then
+				try
+					set nameResult to display dialog "Confirm or edit output filename for '" &amp; originalName &amp; "." &amp; originalExtension &amp; "':" default answer originalFullName with title "Confirm Output Filename"
+					set chosenOutputFileName to text returned of nameResult
+					if chosenOutputFileName is "" then error "Filename cannot be empty."
+
+					# Ensure the chosen name ends with the correct extension (finalOutputExtension)
+					set {baseName, ext} to my getFileNameAndExtensionFromText(chosenOutputFileName)
+					if ext does not equal finalOutputExtension then
+						chosenOutputFileName to baseName &amp; "." &amp; finalOutputExtension
+						display notification "Filename adjusted to end with '." &amp; finalOutputExtension &amp; "'" with title "Filename Corrected"
+					end if
+
+				on error errMsg number errNum
+					if errNum = -128 then # User cancelled this specific file's naming
+						display notification "File skipped due to cancellation: " &amp; originalName with title "File Skipped"
+						iterate # Skip to the next file
+					else
+						# Handle other errors like empty filename
+						display dialog "Invalid filename provided: " &amp; errMsg &amp; "\nSkipping this file." buttons {"OK"} default button "OK" with title "Naming Error"
+						iterate # Skip this file
+					end if
+				end try
+			end if # End check for confirmNamesIndividually
+
+			# Get current dimensions using sips
+			set dimensionsOutput to do shell script "sips -g pixelWidth -g pixelHeight " &amp; currentFilePathQuoted
+			set currentWidth to word -1 of (paragraph -2 of dimensionsOutput) as number
+			set currentHeight to word -1 of (paragraph -1 of dimensionsOutput) as number
+
+			# Calculate new max dimension
+			set maxDimension to round (my max(currentWidth, currentHeight) * percentageValue)
+
+			# *** ADDED: Collision Avoidance if NOT confirming names individually (v15) ***
+			set finalOutputFilePath to outputFolder &amp; chosenOutputFileName
+			if not confirmNamesIndividually then
+				set counter to 1
+				set {baseName, ext} to my getFileNameAndExtensionFromText(chosenOutputFileName) # Use utility
+				# Ensure baseName and ext are valid before loop
+				if ext is "" then set ext to finalOutputExtension # Fallback if somehow empty
+				if baseName is "" then set baseName to "untitled"
+
+				repeat while (my fileExists(finalOutputFilePath))
+					set chosenOutputFileName to baseName &amp; "-" &amp; counter &amp; "." &amp; ext
+					set finalOutputFilePath to outputFolder &amp; chosenOutputFileName
+					set counter to counter + 1
+				end repeat
+			end if
+			# *** END: Collision Avoidance ***
+
+			# Construct the final full output path using the potentially modified name
+			set outputFilePathQuoted to quoted form of finalOutputFilePath
+
+			# Build sips command conditionally
+			set sipsBaseCommand to "sips -Z " &amp; maxDimension &amp; " " &amp; currentFilePathQuoted
+			if convertThisFile then
+				# Add format conversion for PNG -&gt; JPG
+				set sipsCommand to sipsBaseCommand &amp; " -s format jpeg --out " &amp; outputFilePathQuoted
+			else
+				# No format conversion needed (either not PNG or keeping PNG)
+				# Important: Even if keeping PNG, explicitly setting format helps sips handle some edge cases
+				set sipsCommand to sipsBaseCommand &amp; " -s format " &amp; finalOutputExtension &amp; " --out " &amp; outputFilePathQuoted
+			end if
+
+			# Run the constructed command
+			do shell script sipsCommand
+
+		on error errMsg number errNum
+			# Catch errors from sips or other issues.
+			if errNum is not -128 then
+				display dialog "Error processing file: " &amp; originalName &amp; "." &amp; originalExtension &amp; "\n\nError: " &amp; errMsg buttons {"OK"} default button "OK" with title "File Processing Error" with icon stop
+			else
+				# Avoid double notifications if they cancelled naming dialog
+				# display notification "Save possibly cancelled for: " &amp; chosenOutputFileName with title "Save Cancelled?"
+			end if
+			# Continue to the next file regardless of error/cancellation here
+		end try
+	end repeat # End of loop through fileList
+
+end processResizeImage # END OF 'processResizeImage' HANDLER
+
+
+# --- Handler for Quick Save as JPG ---
+# *** MODIFIED in v16: Use 'dirname' for path derivation ***
+on processQuickSaveAsJPG(fileList)
+	local currentFileAlias, currentFilePath, nameNoExt, fileExt, sourceFilePathQuoted, outputBaseName, outputFilePath, counter, finalOutputFilePathQuoted, sipsCommand, errMsg, errNum, fileContainerPath
+
+	# Process each file
+	repeat with currentFileAlias in fileList
+		try
+			set currentFilePath to POSIX path of currentFileAlias
+			set {nameNoExt, fileExt} to my getFileNameAndExtension(currentFilePath) # Use existing handler
+
+			# *** MODIFIED: Derive container path using dirname ***
+			try
+				set fileContainerPath to do shell script "dirname " &amp; quoted form of currentFilePath
+				# Add trailing slash unless the result is the root directory "/"
+				if fileContainerPath is not "/" then
+					set fileContainerPath to fileContainerPath &amp; "/"
+				end if
+			on error pathErr
+				error "Error getting directory using dirname for " &amp; quoted form of currentFilePath &amp; ": " &amp; pathErr
+			end try
+			# *** END MODIFICATION ***
+
+			set sourceFilePathQuoted to quoted form of currentFilePath
+			set outputBaseName to nameNoExt &amp; ".jpg"
+			set outputFilePath to fileContainerPath &amp; outputBaseName # Concatenation relies on trailing slash
+			set counter to 1
+			# Keep collision avoidance for non-interactive Quick Save
+			repeat while (my fileExists(outputFilePath))
+				set outputBaseName to nameNoExt &amp; "-" &amp; counter &amp; ".jpg"
+				set outputFilePath to fileContainerPath &amp; outputBaseName
+				set counter to counter + 1
+			end repeat
+			set finalOutputFilePathQuoted to quoted form of outputFilePath
+
+			# Build and run sips command (use 'normal' for ~75% quality JPG)
+			set sipsCommand to "sips -s format jpeg -s formatOptions normal " &amp; sourceFilePathQuoted &amp; " --out " &amp; finalOutputFilePathQuoted
+			do shell script sipsCommand
+
+		on error errMsg number errNum
+			# Try to get original name for error even if path derivation failed early
+			local errorFileName
+			try
+				set errorFileName to my getFileNameAndExtension(POSIX path of currentFileAlias)'s item 1
+			on error
+				set errorFileName to "unknown file"
+			end try
+			display dialog "Error quick saving file: " &amp; errorFileName &amp; "\n\nError (" &amp; errNum &amp; "): " &amp; errMsg buttons {"OK"} default button "OK" with title "File Processing Error" with icon stop
+		end try
+	end repeat # End of loop through fileList
+
+end processQuickSaveAsJPG # END OF 'processQuickSaveAsJPG' HANDLER
+
+
+# --- Utility Handlers ---
+
+# Function to get file name and extension from POSIX path
+on getFileNameAndExtension(posixPath)
+	local oldTIDs, pathComponents, fullName, nameParts, fileExtension, fileName
+	set oldTIDs to AppleScript's text item delimiters
+	try
+		set AppleScript's text item delimiters to "/"
+		set pathComponents to text items of posixPath
+		set fullName to item -1 of pathComponents # Get last component (filename)
+
+		# Handle empty last component if path ends with / (shouldn't happen with file alias input)
+		if fullName is "" and (count pathComponents) &gt; 1 then set fullName to item -2 of pathComponents
+
+		set AppleScript's text item delimiters to "."
+		set nameParts to text items of fullName
+		# Check if there's a dot and it's not the first character (like .hiddenfile)
+		if (count nameParts) &gt; 1 and item 1 of nameParts is not "" then
+			set fileExtension to item -1 of nameParts
+			set fileName to text 1 thru -((length of fileExtension) + 2) of fullName
+		else
+			# No extension or file starts with "."
+			set fileExtension to ""
+			set fileName to fullName
+		end if
+		set AppleScript's text item delimiters to oldTIDs
+	on error e # Ensure delimiters are reset even if error occurs
+		set AppleScript's text item delimiters to oldTIDs
+		error "Error in getFileNameAndExtension for path '" &amp; posixPath &amp; "': " &amp; e
+	end try
+	return {fileName, fileExtension}
+end getFileNameAndExtension # END OF 'getFileNameAndExtension' HANDLER
+
+# Utility: Function to get base name and extension from a filename string
+on getFileNameAndExtensionFromText(fileNameString)
+	local oldTIDs, nameParts, fileExtension, baseName
+	set oldTIDs to AppleScript's text item delimiters
+	try
+		set AppleScript's text item delimiters to "."
+		set nameParts to text items of fileNameString
+		if (count of nameParts) &gt; 1 and item 1 of nameParts is not "" then # Check if there's an extension and it's not just ".something"
+			set fileExtension to item -1 of nameParts
+			set baseName to text 1 thru -((length of fileExtension) + 2) of fileNameString
+		else
+			# No extension or starts with "."
+			set fileExtension to ""
+			set baseName to fileNameString
+		end if
+		set AppleScript's text item delimiters to oldTIDs
+	on error e
+		set AppleScript's text item delimiters to oldTIDs
+		# Fallback if error occurs
+		return {fileNameString, ""}
+	end try
+	# Ensure baseName isn't empty if original was just ".ext"
+	if baseName is "" and fileExtension is not "" then set baseName to "." &amp; fileExtension
+
+	return {baseName, fileExtension}
+end getFileNameAndExtensionFromText
+
+
+# Function to check if a file exists at a given POSIX path
+# Uses shell's 'test -e' for robustness (v15)
+on fileExists(posixPath)
+	try
+		do shell script "test -e " &amp; quoted form of posixPath
+		return true
+	on error
+		return false
+	end try
+end fileExists # END OF 'fileExists' HANDLER
+
+
+# Max function for two numbers
+on max(a, b)
+	if a is greater than b then
+		return a
+	else
+		return b
+	end if
+end max # END OF 'max' HANDLER</string>
+				</dict>
+				<key>BundleIdentifier</key>
+				<string>com.apple.Automator.RunScript</string>
+				<key>CFBundleVersion</key>
+				<string>1.0.2</string>
+				<key>CanShowSelectedItemsWhenRun</key>
+				<false/>
+				<key>CanShowWhenRun</key>
+				<true/>
+				<key>Category</key>
+				<array>
+					<string>AMCategoryUtilities</string>
+				</array>
+				<key>Class Name</key>
+				<string>RunScriptAction</string>
+				<key>InputUUID</key>
+				<string>D1D1F798-59BF-4674-9C50-469AD39E08EF</string>
+				<key>Keywords</key>
+				<array>
+					<string>Run</string>
+				</array>
+				<key>OutputUUID</key>
+				<string>8D74A634-5E7C-4FD2-B6A8-D89674C97A9C</string>
+				<key>UUID</key>
+				<string>C377F60C-D867-4509-8B29-34E8AEF07005</string>
+				<key>UnlocalizedApplications</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>arguments</key>
+				<dict>
+					<key>0</key>
+					<dict>
+						<key>default value</key>
+						<string>on run {input, parameters}
+	
+	(* Your script goes here *)
+	
+	return input
+end run</string>
+						<key>name</key>
+						<string>source</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>0</string>
+					</dict>
+				</dict>
+				<key>isViewVisible</key>
+				<integer>1</integer>
+				<key>location</key>
+				<string>647.000000:368.000000</string>
+				<key>nibPath</key>
+				<string>/System/Library/Automator/Run AppleScript.action/Contents/Resources/Base.lproj/main.nib</string>
+			</dict>
+			<key>isViewVisible</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>connectors</key>
+	<dict/>
+	<key>workflowMetaData</key>
+	<dict>
+		<key>applicationBundleID</key>
+		<string>com.apple.finder</string>
+		<key>applicationBundleIDsByPath</key>
+		<dict>
+			<key>/System/Library/CoreServices/Finder.app</key>
+			<string>com.apple.finder</string>
+		</dict>
+		<key>applicationPath</key>
+		<string>/System/Library/CoreServices/Finder.app</string>
+		<key>applicationPaths</key>
+		<array>
+			<string>/System/Library/CoreServices/Finder.app</string>
+		</array>
+		<key>inputTypeIdentifier</key>
+		<string>com.apple.Automator.fileSystemObject.image</string>
+		<key>outputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>presentationMode</key>
+		<integer>15</integer>
+		<key>processesInput</key>
+		<false/>
+		<key>serviceApplicationBundleID</key>
+		<string>com.apple.finder</string>
+		<key>serviceApplicationPath</key>
+		<string>/System/Library/CoreServices/Finder.app</string>
+		<key>serviceInputTypeIdentifier</key>
+		<string>com.apple.Automator.fileSystemObject.image</string>
+		<key>serviceOutputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>serviceProcessesInput</key>
+		<false/>
+		<key>systemImageName</key>
+		<string>NSActionTemplate</string>
+		<key>useAutomaticInputType</key>
+		<false/>
+		<key>workflowTypeIdentifier</key>
+		<string>com.apple.Automator.servicesMenu</string>
+	</dict>
+</dict>
+</plist>
